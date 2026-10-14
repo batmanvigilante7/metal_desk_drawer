@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Metal Office Desk - Drawer Animation</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; background: #1a1a2e; font-family: system-ui, sans-serif; }
+    #canvas-container { width: 100vw; height: 100vh; }
+    #ui {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      z-index: 10;
+      color: #e0e0e0;
+      pointer-events: none;
+    }
+    #ui h1 { font-size: 1.5rem; font-weight: 500; margin-bottom: 0.5rem; }
+    #ui p { font-size: 0.85rem; opacity: 0.7; line-height: 1.6; }
+    #drawer-hints {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: center;
+      z-index: 10;
+      pointer-events: none;
+    }
+    .hint {
+      background: rgba(0,0,0,0.6);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255,255,255,0.1);
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 0.75rem;
+      color: #aaa;
+      white-space: nowrap;
+    }
+    .hint.active { background: rgba(0,200,100,0.2); border-color: rgba(0,200,100,0.4); color: #0f0; }
+  </style>
+</head>
+<body>
+  <div id="canvas-container"></div>
+  <div id="ui">
+    <h1>Metal Office Desk</h1>
+    <p>Click any drawer to open/close. Drag to orbit. Scroll to zoom.</p>
+  </div>
+  <div id="drawer-hints"></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.165.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.165.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // --- Scene Setup ---
+    const container = document.getElementById('canvas-container');
+    const hintsContainer = document.getElementById('drawer-hints');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(2.5, 1.5, 3);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.2;
+    container.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.target.set(0, 0.7, 0);
+    controls.minDistance = 1.5;
+    controls.maxDistance = 8;
+
+    // --- Lighting ---
+    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambient);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
+    keyLight.position.set(3, 5, 2);
+    keyLight.castShadow = true;
+    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.shadow.camera.near = 0.5;
+    keyLight.shadow.camera.far = 15;
+    keyLight.shadow.camera.left = -3;
+    keyLight.shadow.camera.right = 3;
+    keyLight.shadow.camera.top = 3;
+    keyLight.shadow.camera.bottom = -3;
+    scene.add(keyLight);
+
+    const fillLight = new THREE.DirectionalLight(0x4488ff, 0.5);
+    fillLight.position.set(-3, 2, -2);
+    scene.add(fillLight);
+
+    const rimLight = new THREE.DirectionalLight(0xffcc88, 0.4);
+    rimLight.position.set(0, -2, -4);
+    scene.add(rimLight);
+
+    // Ground plane for shadows
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(20, 20),
+      new THREE.ShadowMaterial({ opacity: 0.15 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = 0;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // --- Drawer Animation System ---
+    const drawerState = new Map(); // mesh -> { isOpen: bool, targetPos: vec3, closedPos: vec3, openOffset: vec3 }
+    const ANIMATION_SPEED = 4; // units per second
+    const OPEN_DISTANCE = 0.42; // how far drawer slides out
+
+    // All drawers slide toward viewer (positive Z)
+    function getSlideDirection() {
+      return new THREE.Vector3(0, 0, 1);
+    }
+
+    function initDrawer(drawer) {
+      const closedPos = drawer.position.clone();
+      const direction = getSlideDirection();
+      const openPos = closedPos.clone().addScaledVector(direction, OPEN_DISTANCE);
+
+      drawerState.set(drawer, {
+        isOpen: false,
+        closedPos,
+        openPos,
+        currentPos: closedPos.clone(),
+        direction
+      });
+
+      drawer.castShadow = true;
+      drawer.receiveShadow = true;
+
+      // Create hint label
+      const hint = document.createElement('div');
+      hint.className = 'hint';
+      hint.textContent = drawer.name.replace('metal_office_desk_', '').replace('_', ' ');
+      hintsContainer.appendChild(hint);
+      drawer.userData.hintElement = hint;
+    }
+
+    function toggleDrawer(drawer) {
+      const state = drawerState.get(drawer);
+      if (!state) return;
+
+      state.isOpen = !state.isOpen;
+      state.targetPos = state.isOpen ? state.openPos : state.closedPos;
+
+      // Update hint visual
+      if (drawer.userData.hintElement) {
+        drawer.userData.hintElement.classList.toggle('active', state.isOpen);
+      }
+    }
+
+    function updateDrawers(delta) {
+      drawerState.forEach((state, drawer) => {
+        if (!state.targetPos) return;
+
+        const current = drawer.position;
+        const target = state.targetPos;
+        const distance = current.distanceTo(target);
+
+        if (distance > 0.001) {
+          // Lerp towards target
+          const step = ANIMATION_SPEED * delta;
+          current.lerp(target, Math.min(step / distance, 1));
+        } else {
+          current.copy(target);
+          state.targetPos = null;
+        }
+      });
+    }
+
+    // --- Raycasting for Click Detection ---
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    function onPointerDown(event) {
+      // Calculate normalized device coordinates
+      const rect = renderer.domElement.getBoundingClientRect();
+      mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(mouse, camera);
+
+      // Only test against drawer meshes
+      const drawerMeshes = Array.from(drawerState.keys());
+      const intersects = raycaster.intersectObjects(drawerMeshes, false);
+
+      if (intersects.length > 0) {
+        const hitMesh = intersects[0].object;
+        // Find the root drawer mesh (in case we hit a child)
+        let drawer = hitMesh;
+        while (drawer.parent && !drawerState.has(drawer)) {
+          drawer = drawer.parent;
+        }
+        if (drawerState.has(drawer)) {
+          toggleDrawer(drawer);
+        }
+      }
+    }
+
+    renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+    // --- Load GLTF Model ---
+    const loader = new GLTFLoader();
+    const modelPath = 'metal_office_desk_4k.gltf';
+
+    loader.load(modelPath, (gltf) => {
+      const model = gltf.scene;
+      scene.add(model);
+
+      // Enable shadows on all meshes
+      model.traverse((child) => {
+        if (child.isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+      });
+
+      // Compute desk center from main desk mesh
+      const deskMesh = model.getObjectByName('metal_office_desk');
+      const deskCenter = new THREE.Vector3();
+      if (deskMesh) {
+        deskMesh.getWorldPosition(deskCenter);
+      } else {
+        // Fallback: compute from all meshes
+        const box = new THREE.Box3().setFromObject(model);
+        box.getCenter(deskCenter);
+      }
+
+      // Find and initialize drawers
+      const drawerNames = [
+        'metal_office_desk_drawer_01',
+        'metal_office_desk_drawer_02',
+        'metal_office_desk_drawer_03',
+        'metal_office_desk_drawer_04',
+        'metal_office_desk_drawer_05',
+        'metal_office_desk_drawer_06'
+      ];
+
+      drawerNames.forEach(name => {
+        const drawer = model.getObjectByName(name);
+        if (drawer) {
+          initDrawer(drawer);
+          console.log(`Initialized drawer: ${name} | slides toward +Z`);
+        } else {
+          console.warn(`Drawer not found: ${name}`);
+        }
+      });
+
+      // Center model vertically
+      const box = new THREE.Box3().setFromObject(model);
+      const center = box.getCenter(new THREE.Vector3());
+      model.position.y -= center.y;
+
+      // Focus camera on model
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      camera.position.set(maxDim * 1.2, maxDim * 0.7, maxDim * 1.5);
+      controls.target.copy(center);
+      controls.target.y = size.y * 0.5;
+      controls.update();
+
+    }, undefined, (error) => {
+      console.error('Error loading GLTF:', error);
+    });
+
+    // --- Animation Loop ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+
+      controls.update();
+      updateDrawers(delta);
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // --- Resize Handler ---
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    // --- Keyboard Shortcuts ---
+    window.addEventListener('keydown', (e) => {
+      if (e.key >= '1' && e.key <= '6') {
+        const index = parseInt(e.key) - 1;
+        const drawerNames = [
+          'metal_office_desk_drawer_01',
+          'metal_office_desk_drawer_02',
+          'metal_office_desk_drawer_03',
+          'metal_office_desk_drawer_04',
+          'metal_office_desk_drawer_05',
+          'metal_office_desk_drawer_06'
+        ];
+        const model = scene.children.find(c => c.type === 'Scene' || c.name === 'Scene') || scene;
+        const drawer = model.getObjectByName(drawerNames[index]);
+        if (drawer) toggleDrawer(drawer);
+      }
+      if (e.key === ' ') {
+        // Toggle all drawers
+        drawerState.forEach((_, drawer) => toggleDrawer(drawer));
+      }
+    });
+  </script>
+</body>
+</html>
